@@ -1,8 +1,20 @@
+From becbd40a94ef4885f0d3f8bc9b795692a7537f88 Mon Sep 17 00:00:00 2001
+From: "Dusan Cervenka (nxa14949)" <dusan.cervenka@nxp.com>
+Date: Mon, 12 Mar 2018 13:25:51 +0100
+Subject: [PATCH] rpmsg_sysfs_interface_4_9_51
+
+---
+ drivers/rpmsg/Kconfig          |    5 +
+ drivers/rpmsg/Makefile         |    1 +
+ drivers/rpmsg/rpmsg_multiept.c | 1187 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1193 insertions(+)
+ create mode 100644 drivers/rpmsg/rpmsg_multiept.c
+
 diff --git a/drivers/rpmsg/Kconfig b/drivers/rpmsg/Kconfig
-index 15ad370..74b9555 100644
+index af1c66f138cf..8f99e936c8ac 100644
 --- a/drivers/rpmsg/Kconfig
 +++ b/drivers/rpmsg/Kconfig
-@@ -16,4 +16,9 @@ config IMX_RPMSG_TTY
+@@ -43,4 +43,9 @@ config IMX_RPMSG_TTY
  	default m
  	depends on RPMSG && m
  
@@ -13,20 +25,20 @@ index 15ad370..74b9555 100644
 +
  endmenu
 diff --git a/drivers/rpmsg/Makefile b/drivers/rpmsg/Makefile
-index da6f243..c8ce47b 100644
+index 1548f5c55815..733f42223019 100644
 --- a/drivers/rpmsg/Makefile
 +++ b/drivers/rpmsg/Makefile
-@@ -1,3 +1,4 @@
- obj-$(CONFIG_RPMSG)	+= virtio_rpmsg_bus.o
-+obj-$(CONFIG_RPMSG_MULTIENDPOINT)	+= rpmsg_multiept.o
+@@ -5,3 +5,4 @@ obj-$(CONFIG_RPMSG_VIRTIO)	+= virtio_rpmsg_bus.o
+ obj-$(CONFIG_HAVE_IMX_RPMSG)	+= imx_rpmsg.o
  obj-$(CONFIG_IMX_RPMSG_PINGPONG)	+= imx_rpmsg_pingpong.o
  obj-$(CONFIG_IMX_RPMSG_TTY)	+= imx_rpmsg_tty.o
++obj-$(CONFIG_RPMSG_MULTIENDPOINT)	+= rpmsg_multiept.o
 diff --git a/drivers/rpmsg/rpmsg_multiept.c b/drivers/rpmsg/rpmsg_multiept.c
 new file mode 100644
-index 0000000..90ede9a
+index 000000000000..386929fe6205
 --- /dev/null
 +++ b/drivers/rpmsg/rpmsg_multiept.c
-@@ -0,0 +1,1184 @@
+@@ -0,0 +1,1187 @@
 +/*
 + * Copyright (C) 2016 Freescale Semiconductor, Inc.
 + *
@@ -114,11 +126,11 @@ index 0000000..90ede9a
 +static DEVICE_ATTR(src, S_IRUGO | S_IWUSR | S_IWGRP,
 +	dev_attr_src_show, dev_attr_src_store);
 +
-+
 +struct channel_device {
 +	struct device *chnl_dev;
-+	int id;
-+	struct rpmsg_channel *chnl;
++    int id;
++	struct rpmsg_channel_info chnl_info;
++	struct rpmsg_device *rpmsg_dev;
 +	struct channel_device *next;
 +};
 +
@@ -148,15 +160,15 @@ index 0000000..90ede9a
 +	struct endpoint_device *next;
 +};
 +
-+static void rpmsg_rx_cb(struct rpmsg_channel *chnl, void *data,
++static int rpmsg_rx_cb(struct rpmsg_device *rpmsg_dev, void *data,
 +			int len, void *priv, u32 src);
 +static int endpoint_list_add(struct endpoint_device **base,
 +				struct channel_device *chnl_dev,
 +				struct rpmsg_endpoint *new_ept,
-+				int addr,
++				struct rpmsg_channel_info channel_info,
 +				enum rpmsg_ept_type type, pid_t pid);
 +static void channel_list_add(struct channel_device **base,
-+				struct rpmsg_channel *chnl);
++				struct rpmsg_device *rpmsg_dev);
 +static int channel_get_free_id(struct channel_device **base);
 +
 +struct channel_device *channel_list;
@@ -213,7 +225,7 @@ index 0000000..90ede9a
 +}
 +
 +static void channel_list_add(struct channel_device **base,
-+			struct rpmsg_channel *chnl)
++			struct rpmsg_device *rpmsg_dev)
 +{
 +	struct channel_device *iterator = NULL;
 +	struct channel_device *prev = NULL;
@@ -221,7 +233,7 @@ index 0000000..90ede9a
 +	int retval = -1;
 +
 +	ASSERT(base);
-+	ASSERT(chnl);
++	ASSERT(rpmsg_dev);
 +
 +	pr_debug("rpmsg: called %s\n", __func__);
 +	id = channel_get_free_id(base);
@@ -250,7 +262,7 @@ index 0000000..90ede9a
 +	}
 +
 +	iterator->next = NULL;
-+	iterator->chnl = chnl;
++	iterator->rpmsg_dev = rpmsg_dev;
 +	iterator->id = id;
 +
 +	/* Create /channel_xx entry in /sys/rpmsg_interface
@@ -348,10 +360,10 @@ index 0000000..90ede9a
 +	ASSERT(ept_dev);
 +	chnl_dev = ept_dev->chnl_dev;
 +	ASSERT(chnl_dev);
-+	ASSERT(chnl_dev->chnl);
++	ASSERT(chnl_dev->rpmsg_dev);
 +
 +	return snprintf(buffer, PAGE_SIZE, "%s\n",
-+				chnl_dev->chnl->id.name);
++				chnl_dev->rpmsg_dev->id.name);
 +}
 +
 +static ssize_t dev_attr_type_show(struct device *dev,
@@ -373,7 +385,7 @@ index 0000000..90ede9a
 +static int endpoint_list_add(struct endpoint_device **base,
 +			struct channel_device *chnl_dev,
 +			struct rpmsg_endpoint *new_ept,
-+			int addr,
++			struct rpmsg_channel_info channel_info,
 +			enum rpmsg_ept_type type, pid_t pid)
 +{
 +	struct endpoint_device *iterator = NULL;
@@ -383,7 +395,7 @@ index 0000000..90ede9a
 +
 +	pr_debug("rpmsg: called %s\n", __func__);
 +
-+	if (addr > RPMSG_MINOR_EPT_MASK) {
++	if (channel_info.src > RPMSG_MINOR_EPT_MASK) {
 +		pr_err("rpmsg: too high ept address\n");
 +		return -1;
 +	}
@@ -428,9 +440,9 @@ index 0000000..90ede9a
 +	}
 +
 +	if (new_ept == NULL) {
-+		ept = rpmsg_create_ept(chnl_dev->chnl,
++		ept = rpmsg_create_ept(chnl_dev->rpmsg_dev,
 +					rpmsg_rx_cb,
-+					iterator, addr);
++					iterator, channel_info);
 +		if (NULL == ept) {
 +			pr_err("rpmsg: cannot create ept\n");
 +			goto ept_add_err_early;
@@ -440,9 +452,9 @@ index 0000000..90ede9a
 +		ept = new_ept;
 +	}
 +	/* by default bind to remote default endpoint */
-+	iterator->src = chnl_dev->chnl->dst;
++	iterator->src = chnl_dev->rpmsg_dev->dst;
 +	/* by default send to remote default endpoint */
-+	iterator->dst = chnl_dev->chnl->dst;
++	iterator->dst = chnl_dev->rpmsg_dev->dst;
 +	/* keep reference to channel dev */
 +	iterator->chnl_dev = chnl_dev;
 +
@@ -612,7 +624,7 @@ index 0000000..90ede9a
 +	for (iterator = *base;
 +		iterator != NULL;
 +		prev = iterator, iterator = iterator->next) {
-+		if (iterator->ept->rpdev == rm->chnl) {
++		if (iterator->ept->rpdev == rm->rpmsg_dev) {
 +			if ((iterator == *base) && (iterator->next == NULL)) {
 +				*base = NULL;
 +				endpoint_device_free(iterator);
@@ -630,7 +642,7 @@ index 0000000..90ede9a
 +
 +static int channel_list_rm(struct channel_device **base,
 +			struct endpoint_device **ept_base,
-+			struct rpmsg_channel *chnl)
++			struct rpmsg_device *rpmsg_dev)
 +{
 +	struct channel_device *iterator = NULL;
 +	struct channel_device *prev = NULL;
@@ -640,7 +652,7 @@ index 0000000..90ede9a
 +	for (iterator = *base;
 +		iterator != NULL;
 +		prev = iterator, iterator = iterator->next) {
-+		if (iterator->chnl == chnl) {
++		if (iterator->rpmsg_dev == rpmsg_dev) {
 +			if ((iterator == *base) && (iterator->next == NULL)) {
 +				*base = NULL;
 +				channel_device_free(ept_base, iterator);
@@ -791,7 +803,7 @@ index 0000000..90ede9a
 +		size, ept_dev->dst);
 +
 +	/* Send RPMSG message */
-+	retval = rpmsg_send_offchannel(ept_dev->ept->rpdev,
++	retval = rpmsg_send_offchannel(ept_dev->ept,
 +                ept_dev->ept->addr,
 +                ept_dev->dst,
 +				(void *)ept_dev->txbuff,
@@ -847,14 +859,14 @@ index 0000000..90ede9a
 +	chnl_dev =  (struct channel_device *)dev_get_drvdata(dev);
 +
 +	ASSERT(chnl_dev);
-+	ASSERT(chnl_dev->chnl);
-+	ASSERT(chnl_dev->chnl->ept);
++	ASSERT(chnl_dev->rpmsg_dev);
++	ASSERT(chnl_dev->rpmsg_dev->ept);
 +
 +	pr_debug("rpmsg: local default channel addr %d\n",
-+		chnl_dev->chnl->ept->addr);
++		chnl_dev->rpmsg_dev->ept->addr);
 +
 +	return snprintf(buffer, PAGE_SIZE, "%d\n",
-+			chnl_dev->chnl->ept->addr);
++			chnl_dev->rpmsg_dev->ept->addr);
 +}
 +
 +
@@ -872,14 +884,14 @@ index 0000000..90ede9a
 +	chnl_dev =  (struct channel_device *)dev_get_drvdata(dev);
 +
 +	ASSERT(chnl_dev);
-+	ASSERT(chnl_dev->chnl);
-+	ASSERT(chnl_dev->chnl->ept);
++	ASSERT(chnl_dev->rpmsg_dev);
++	ASSERT(chnl_dev->rpmsg_dev->ept);
 +
 +	pr_debug("rpmsg: remote default channel addr %d\n",
-+		chnl_dev->chnl->dst);
++		chnl_dev->rpmsg_dev->dst);
 +
 +	return snprintf(buffer, PAGE_SIZE, "%d\n",
-+			chnl_dev->chnl->dst);
++			chnl_dev->rpmsg_dev->dst);
 +}
 +
 +static ssize_t dev_attr_name_show(struct device *dev,
@@ -896,11 +908,11 @@ index 0000000..90ede9a
 +	chnl_dev =  (struct channel_device *)dev_get_drvdata(dev);
 +
 +	ASSERT(chnl_dev);
-+	ASSERT(chnl_dev->chnl);
++	ASSERT(chnl_dev->rpmsg_dev);
 +
 +
 +	return snprintf(buffer, PAGE_SIZE, "%s\n",
-+			chnl_dev->chnl->id.name);
++			chnl_dev->rpmsg_dev->id.name);
 +}
 +
 +static ssize_t dev_attr_ept_delete_store(struct device *dev,
@@ -936,8 +948,7 @@ index 0000000..90ede9a
 +			struct device_attribute *attr,
 +			const char *buffer, size_t size)
 +{
-+	struct channel_device *chnl_dev = NULL;
-+	int ept_addr = -1;
++	struct channel_device *chnl_dev = NULL;    
 +	int retval = -1;
 +	char type;
 +
@@ -946,40 +957,41 @@ index 0000000..90ede9a
 +	ASSERT(dev);
 +
 +	chnl_dev =  (struct channel_device *)dev_get_drvdata(dev);
++    chnl_dev->chnl_info.src = -1;
 +
 +	pr_debug("rpmsg: called %s\n", __func__);
 +
-+	retval = sscanf(buffer, "%d,%c", &ept_addr, &type);
++	retval = sscanf(buffer, "%d,%c", &chnl_dev->chnl_info.src, &type);
 +	if (retval == -1) {
 +		pr_err("rpmsg: scanf error\n");
 +		return -1;
 +	}
 +
-+	if (ept_addr < 0) {
++	if (chnl_dev->chnl_info.src < 0) {
 +		pr_err("rpmsg: negative addr\n");
 +		return -1;
 +	}
 +
 +	ASSERT(chnl_dev);
-+	ASSERT(chnl_dev->chnl);
-+	ASSERT(chnl_dev->chnl->ept);
++	ASSERT(chnl_dev->rpmsg_dev);
++	ASSERT(chnl_dev->rpmsg_dev->ept);
 +
 +	pr_debug("rpmsg: adding endpoint %d, default %d\n",
-+		ept_addr, chnl_dev->chnl->ept->addr);
++		chnl_dev->chnl_info.src, chnl_dev->rpmsg_dev->ept->addr);
 +
-+	if (ept_addr == chnl_dev->chnl->ept->addr) {
++	if (chnl_dev->chnl_info.src == chnl_dev->rpmsg_dev->ept->addr) {
 +		pr_debug("rpmsg: adding default endpoint\n");
 +
 +		retval = endpoint_list_add(&endpoint_list, chnl_dev,
-+					chnl_dev->chnl->ept,
-+					ept_addr,
++					chnl_dev->rpmsg_dev->ept,
++					chnl_dev->chnl_info,
 +					(type == 'S') ?
 +					ENDPOINT_STREAM : ENDPOINT_DGRAM,
 +					current->pid);
 +	} else {
 +		pr_debug("rpmsg: adding regular endpoint\n");
 +		retval = endpoint_list_add(&endpoint_list, chnl_dev, NULL,
-+					ept_addr,
++					chnl_dev->chnl_info,
 +					(type == 'S') ?
 +					ENDPOINT_STREAM : ENDPOINT_DGRAM,
 +					current->pid);
@@ -1039,7 +1051,7 @@ index 0000000..90ede9a
 +	return size;
 +}
 +
-+static void rpmsg_rx_cb(struct rpmsg_channel *chnl, void *data,
++static int rpmsg_rx_cb(struct rpmsg_device *rpmsg_dev, void *data,
 +			int len, void *priv, u32 src)
 +{
 +	int retlen = -1;
@@ -1048,17 +1060,17 @@ index 0000000..90ede9a
 +	pr_debug("rpmsg: called %s\n", __func__);
 +
 +	ASSERT(data);
-+	ASSERT(chnl);
++	ASSERT(rpmsg_dev);
 +
 +	if (priv == NULL) {
 +		pr_info("rpmsg: data at unexported default endpoint");
 +		pr_info(", dropping...\n");
-+		return;
++		return -1;
 +	}
 +
 +	if (!len) {
 +		pr_info("rpmsg: zero-length msg from src %d\n", src);
-+		return;
++		return -1;
 +	}
 +
 +	ept_dev = (struct endpoint_device *)priv;
@@ -1070,7 +1082,7 @@ index 0000000..90ede9a
 +			pr_info("rpmsg:");
 +			pr_info("msg from src %d, expected from %d, drop.\n",
 +				src, ept_dev->src);
-+			return;
++			return -1;
 +		}
 +
 +		/* ept_dev contains reference to a FIFO
@@ -1086,24 +1098,24 @@ index 0000000..90ede9a
 +		if (kfifo_avail(&ept_dev->fifo) <
 +			 (sizeof(u32) + sizeof(int))) {
 +			pr_info("rpmsg: signal fifo dropping...\n");
-+			return;
++			return -1;
 +		}
 +
 +		if (kfifo_avail(&ept_dev->fifo) < len) {
 +			pr_info("rpmsg: dropping...\n");
-+			return;
++			return -1;
 +		}
 +
 +		retlen = kfifo_in(&ept_dev->sig_fifo, &src, sizeof(u32));
 +		if (retlen != sizeof(u32)) {
 +			pr_err("rpmsg: signal fifo error1\n");
-+			return;
++			return -1;
 +		}
 +
 +		retlen = kfifo_in(&ept_dev->sig_fifo, &len, sizeof(int));
 +		if (retlen != sizeof(int)) {
 +			pr_err("rpmsg: signal fifo error2\n");
-+			return;
++			return -1;
 +		}
 +
 +		pr_debug("rpmsg: msg from src %d, len %d.\n",
@@ -1115,9 +1127,11 @@ index 0000000..90ede9a
 +		if (retlen < len) /* Too fast, dropping...  */
 +			pr_info("rpmsg: dropping...\n");
 +	}
++	
++	return 0;
 +}
 +
-+static int rpmsg_multiept_probe(struct rpmsg_channel *rpchnl)
++static int rpmsg_multiept_probe(struct rpmsg_device *rpchnl)
 +{
 +	pr_info("rpmsg: new channel 0x%x -> 0x%x\n",
 +		rpchnl->src, rpchnl->dst);
@@ -1131,15 +1145,15 @@ index 0000000..90ede9a
 +	return 0;
 +}
 +
-+static void rpmsg_multiept_remove(struct rpmsg_channel *chnl)
++static void rpmsg_multiept_remove(struct rpmsg_device *rpmsg_dev)
 +{
 +	int ret = -1;
 +
-+	ASSERT(chnl);
++	ASSERT(rpmsg_dev);
 +	pr_debug("rpmsg: called %s\n", __func__);
 +
 +	/* remove channel from the sysfs */
-+	ret = channel_list_rm(&channel_list, &endpoint_list, chnl);
++	ret = channel_list_rm(&channel_list, &endpoint_list, rpmsg_dev);
 +	ASSERT(ret == 0); /* should always pass */
 +}
 +
@@ -1147,6 +1161,7 @@ index 0000000..90ede9a
 +	{ .name	= "rpmsg-openamp-demo-channel" },
 +	{},
 +};
++
 +MODULE_DEVICE_TABLE(rpmsg, rpmsg_driver_sysfs_id_table);
 +
 +static struct rpmsg_driver rpmsg_multiept_client = {
@@ -1211,3 +1226,6 @@ index 0000000..90ede9a
 +
 +MODULE_DESCRIPTION("Remote processor messaging sysfs client driver");
 +MODULE_LICENSE("GPL v2");
+-- 
+2.14.1
+
